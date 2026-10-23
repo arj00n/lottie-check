@@ -40,7 +40,7 @@ Usually Figma dot-matrix/LED text or particle fields drawn as one vector per dot
 - **Static:** flatten the whole comp to one image.
 - **Path animation or animation inside the group:** don't flatten that group.
 
-Worked example: `~/lottie-check/fixes/flatten_led_example.py` (LED letters → 34 image layers). The renderer is `~/lottie-check/ios-harness/.build/release/Rasterize <mini.json>...`. It renders frame 0 of each mini comp to a transparent PNG cropped to content, using lottie-ios 4.5.0, and prints `BBOX path x y w h`. Build the mini comp so the group is centred on a canvas larger than it (`WARN … touches canvas edge` means grow the canvas). Embed the PNGs as data URIs, then pack with `pack_lottie.py`.
+Worked example: `~/lottie-check/fixes/flatten_led_example.py` (LED letters → 34 image layers). The renderer is `~/lottie-check/bin/Rasterize <mini.json>...` (or `ios-harness/.build/release/Rasterize` in a source checkout). It renders frame 0 of each mini comp to a transparent PNG cropped to content, using lottie-ios 4.5.0, and prints `BBOX path x y w h`. Build the mini comp so the group is centred on a canvas larger than it (`WARN … touches canvas edge` means grow the canvas). Embed the PNGs as data URIs, then pack with `pack_lottie.py`.
 
 ### Heavy images (lint warning "images decode to N MB")
 

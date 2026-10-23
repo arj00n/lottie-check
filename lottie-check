@@ -29,7 +29,9 @@ AVD = "lottie_check"
 SYSTEM_IMAGE = "system-images;android-35;google_apis;arm64-v8a"
 PKG = "in.justswish.lottiecheck"
 APK = ROOT / "android/app/build/outputs/apk/debug/app-debug.apk"
-IOS_BIN = ROOT / "ios-harness/.build/release/LottieCheckIOS"
+# A prebuilt bundle (make-bundle.sh) ships bin/ and android/lib/; a source checkout builds them on demand.
+BUNDLE = (ROOT / "bin/LottieCheckIOS").exists()
+IOS_BIN = ROOT / "bin/LottieCheckIOS" if BUNDLE else ROOT / "ios-harness/.build/release/LottieCheckIOS"
 REQUIRED_LAYER_KEYS = ("ty", "ip", "op", "st", "ks")
 # Bump when checks change so cached results are recomputed.
 TOOL_VERSION = "2"
@@ -163,6 +165,8 @@ def default_frames(span):
 
 def ios_binary():
     harness = ROOT / "ios-harness"
+    if BUNDLE:
+        return IOS_BIN
     if not IOS_BIN.exists() or newest_mtime(harness) > IOS_BIN.stat().st_mtime:
         log("building iOS harness")
         subprocess.run(["swift", "build", "-c", "release", "-q"], cwd=harness, check=True, env=env())
@@ -182,6 +186,34 @@ def run_ios(path: Path, out: Path, frames):
 
 # ---------------------------------------------------------------- Android under Robolectric (default)
 
+def bundle_java():
+    """Bundled JRE on Apple Silicon, otherwise an installed Java 17+."""
+    bundled = ROOT / "jre/bin/java"
+    if bundled.exists() and os.uname().machine == "arm64":
+        return str(bundled)
+    if (Path(JAVA_HOME) / "bin/java").exists():
+        return str(Path(JAVA_HOME) / "bin/java")
+    found = subprocess.run(["/usr/libexec/java_home", "-v", "17+"], capture_output=True, text=True).stdout.strip()
+    if found:
+        return f"{found}/bin/java"
+    raise RuntimeError("Java 17+ not found: run install.sh")
+
+
+def android_command(listing: Path, renders: Path):
+    """The Robolectric check: plain java in a bundle, Gradle in a source checkout. Returns (argv, cwd)."""
+    if not BUNDLE:
+        return (["./gradlew", ":app:testDebugUnitTest", "-q", f"-PlottieList={listing}", f"-PlottieOut={renders}",
+                 "-PlottieBench=true"], ROOT / "android")
+    android = ROOT / "android"
+    classpath = ":".join(str(android / entry) for entry in (android / "classpath.txt").read_text().split())
+    # cwd=android/: Robolectric resolves the relative resource paths in config/…/test_config.properties from there
+    # install.sh downloads Android's runtime jar here (Robolectric can't load it from a path with spaces)
+    android_all = Path.home() / ".lottie-check/android-all"
+    return ([bundle_java(), "-Xmx2g", "-Drobolectric.offline=true", f"-Drobolectric.dependency.dir={android_all}",
+             f"-Dlottie.list={listing}", f"-Dlottie.out={renders}", "-Dlottie.bench=true",
+             "-cp", classpath, "org.junit.runner.JUnitCore", "in.justswish.lottiecheck.RobolectricCheck"], android)
+
+
 def run_android_robolectric(jobs):
     """jobs: list of (path, out dir, frames). Returns {path: result}. One JVM for the whole batch."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -197,9 +229,8 @@ def run_android_robolectric(jobs):
         (tmp / "files.tsv").write_text("\n".join(listing))
         renders = tmp / "renders"
         renders.mkdir()
-        proc = subprocess.run(["./gradlew", ":app:testDebugUnitTest", "-q", f"-PlottieList={tmp / 'files.tsv'}",
-                               f"-PlottieOut={renders}", "-PlottieBench=true"],
-                              cwd=ROOT / "android", capture_output=True, text=True, env=env())
+        argv, cwd = android_command(tmp / "files.tsv", renders)
+        proc = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, env=env())
         results_file = renders / "android-results.txt"
         lines = results_file.read_text().splitlines() if results_file.exists() else []
         results = {}
@@ -427,6 +458,8 @@ def main():
     ap.add_argument("--no-open", action="store_true")
     ap.add_argument("--out", type=Path, default=ROOT / "out")
     a = ap.parse_args()
+    if a.emulator and BUNDLE:
+        sys.exit("--emulator needs the source checkout (git clone + ./install.sh); the bundle checks Android with Robolectric")
     a.out.mkdir(parents=True, exist_ok=True)
     signature = f"v{TOOL_VERSION} frames={a.frames} ios={not a.no_ios} android={'' if a.no_android else 'emu' if a.emulator else 'robo'}"
 

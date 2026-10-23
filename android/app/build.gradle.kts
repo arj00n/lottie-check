@@ -38,3 +38,14 @@ dependencies {
   testImplementation("org.robolectric:robolectric:4.17")
   testImplementation("androidx.test:core:1.6.1")
 }
+
+// Prints the Robolectric check's runtime classpath; make-bundle.sh copies it so the check runs without Gradle.
+tasks.register("printCheckerClasspath") {
+  // everything the test classpath and Robolectric's resource config point at
+  dependsOn("compileDebugUnitTestKotlin", "processDebugUnitTestJavaRes", "bundleDebugClassesToRuntimeJar",
+            "packageDebugUnitTestForUnitTest", "processDebugManifestForPackage", "processDebugResources")
+  doLast {
+    val test = tasks.getByName<Test>("testDebugUnitTest")
+    test.classpath.files.forEach { println("CP $it") }
+  }
+}

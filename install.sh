@@ -5,6 +5,7 @@
 #   ./install.sh --with-inbox    also watch ~/Lotties/inbox (checks every file dropped in)
 #   ./install.sh --with-inbox --autofix
 #                                and let Claude Code try to fix files that fail (needs `claude`, uses your plan)
+#   ./install.sh --check-only    set up and self-test the checkers only; no Finder, launchd or Claude changes (CI)
 #
 # Safe to re-run: it updates in place. Undo with ./uninstall.sh.
 set -euo pipefail
@@ -12,10 +13,12 @@ set -euo pipefail
 DIR=${0:A:h}
 WITH_INBOX=0
 AUTOFIX=0
+CHECK_ONLY=0
 for arg in "$@"; do
   case $arg in
     --with-inbox) WITH_INBOX=1 ;;
     --autofix) AUTOFIX=1 ;;
+    --check-only) CHECK_ONLY=1 ;;
     *) echo "unknown option: $arg"; exit 2 ;;
   esac
 done
@@ -23,37 +26,69 @@ done
 step() { print -P "\n%B==> $1%b" }
 fail() { print -P "%F{red}✗ $1%f"; exit 1 }
 
+# A prebuilt bundle (make-bundle.sh) ships bin/ and android/lib/; a source checkout builds everything here.
+BUNDLE=0
+[[ -x "$DIR/bin/LottieCheckIOS" ]] && BUNDLE=1
+
 step "Checking prerequisites"
 [[ $(uname) == Darwin ]] || fail "macOS only"
-xcode-select -p >/dev/null 2>&1 || fail "Xcode Command Line Tools missing: run  xcode-select --install  then re-run this script"
-command -v brew >/dev/null || fail "Homebrew missing: install it from https://brew.sh then re-run this script"
-BREW=$(brew --prefix)
-# downloaded zips carry the quarantine flag; Finder refuses to run quarantined Quick Actions
+# downloaded zips carry the quarantine flag; macOS refuses to run quarantined binaries and Quick Actions
 xattr -dr com.apple.quarantine "$DIR" 2>/dev/null || true
+BREW=$( (command -v brew >/dev/null && brew --prefix) || echo /opt/homebrew)
 
-step "Java 17 and Android SDK (Homebrew)"
-for pkg in openjdk@17 android-commandlinetools; do
-  if brew list "$pkg" >/dev/null 2>&1; then echo "$pkg already installed"; else brew install "$pkg"; fi
-done
-export JAVA_HOME="$BREW/opt/openjdk@17"
-SDK="$BREW/share/android-commandlinetools"
-SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
-if [[ ! -d "$SDK/platforms/android-35" || ! -d "$SDK/build-tools/35.0.0" ]]; then
-  echo "Installing Android platform 35 + build tools. You may be asked to accept Google's SDK licence."
-  "$SDKMANAGER" "platforms;android-35" "build-tools;35.0.0"
+if (( BUNDLE )); then
+  step "Java runtime"
+  if [[ $(uname -m) == arm64 ]]; then
+    echo "using the bundled Java 17 (Apple Silicon)"
+  elif /usr/libexec/java_home -v 17+ >/dev/null 2>&1 || [[ -x "$BREW/opt/openjdk@17/bin/java" ]]; then
+    echo "using the installed Java 17+ (Intel Mac)"
+  elif command -v brew >/dev/null; then
+    brew install openjdk@17
+  else
+    fail "Intel Macs need Java 17+: install Homebrew (https://brew.sh) and re-run, or install any JDK 17+"
+  fi
+
+  step "Android runtime for Robolectric (one-time 200 MB download)"
+  read -r ANDROID_ALL_URL ANDROID_ALL_SHA < "$DIR/android/android-all.txt"
+  # outside the bundle: Robolectric can't load it from a path with spaces, and it survives bundle updates
+  mkdir -p "$HOME/.lottie-check/android-all"
+  JAR="$HOME/.lottie-check/android-all/${ANDROID_ALL_URL:t}"
+  if [[ ! -f $JAR ]] || [[ $(shasum -a 256 "$JAR" | cut -d' ' -f1) != $ANDROID_ALL_SHA ]]; then
+    curl -fL --progress-bar -o "$JAR.part" "$ANDROID_ALL_URL" || fail "download failed: $ANDROID_ALL_URL"
+    [[ $(shasum -a 256 "$JAR.part" | cut -d' ' -f1) == $ANDROID_ALL_SHA ]] || { rm -f "$JAR.part"; fail "checksum mismatch for ${JAR:t}"; }
+    mv "$JAR.part" "$JAR"
+  else
+    echo "already downloaded"
+  fi
+else
+  xcode-select -p >/dev/null 2>&1 || fail "Xcode Command Line Tools missing: run  xcode-select --install  then re-run this script"
+  command -v brew >/dev/null || fail "Homebrew missing: install it from https://brew.sh then re-run this script"
+
+  step "Java 17 and Android SDK (Homebrew)"
+  for pkg in openjdk@17 android-commandlinetools; do
+    if brew list "$pkg" >/dev/null 2>&1; then echo "$pkg already installed"; else brew install "$pkg"; fi
+  done
+  export JAVA_HOME="$BREW/opt/openjdk@17"
+  SDK="$BREW/share/android-commandlinetools"
+  if [[ ! -d "$SDK/platforms/android-35" || ! -d "$SDK/build-tools/35.0.0" ]]; then
+    echo "Installing Android platform 35 + build tools. You may be asked to accept Google's SDK licence."
+    "$SDK/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0"
+  fi
+  echo "sdk.dir=$SDK" > "$DIR/android/local.properties"
+
+  step "Building the iOS checker (lottie-ios 4.5.0)"
+  (cd "$DIR/ios-harness" && swift build -c release -q)
+
+  step "Building the Android checker (lottie-android 6.5.2 under Robolectric)"
+  (cd "$DIR/android" && ./gradlew :app:compileDebugUnitTestKotlin -q)
 fi
-echo "sdk.dir=$SDK" > "$DIR/android/local.properties"
 
-step "Building the iOS checker (lottie-ios 4.5.0)"
-(cd "$DIR/ios-harness" && swift build -c release -q)
-
-step "Building the Android checker (lottie-android 6.5.2 under Robolectric)"
-(cd "$DIR/android" && ./gradlew :app:compileDebugUnitTestKotlin -q)
-
-step "Self-test on the bundled samples"
-mkdir -p "$DIR/out"
+step "Self-test"
+mkdir -p "$DIR/out/selftest"
+python3 "$DIR/selftest/make_samples.py" "$DIR/out/selftest"
 set +e
-"$DIR/lottie-check" "$DIR/samples/good.lottie" "$DIR/samples/broken.lottie" --force --no-open --json > "$DIR/out/selftest.json" 2> "$DIR/out/selftest.log"
+"$DIR/lottie-check" "$DIR/out/selftest/good.lottie" "$DIR/out/selftest/broken.lottie" --force --no-open --json \
+  > "$DIR/out/selftest.json" 2> "$DIR/out/selftest.log"
 set -e
 python3 - "$DIR/out/selftest.json" <<'PY' || { tail -20 "$DIR/out/selftest.log"; fail "self-test failed (log above)"; }
 import json, sys
@@ -61,8 +96,14 @@ results = {r["name"]: r for r in json.load(open(sys.argv[1]))}
 good, broken = results["good.lottie"], results["broken.lottie"]
 assert good["status"] == "pass", f"good.lottie should pass: {good['status']}"
 assert broken["status"] == "fail" and not broken["ios"]["ok"] and not broken["android"]["ok"], "broken.lottie should fail on both"
-print("good.lottie passes, broken.lottie fails on iOS and Android: checks work")
+print("a valid lottie passes and a broken one fails on iOS and Android: checks work")
 PY
+
+if (( CHECK_ONLY )); then
+  step "Done (check-only)"
+  echo "Terminal:  $DIR/lottie-check FILE…"
+  exit 0
+fi
 
 step "Finder Quick Action: Check Lottie"
 SERVICE="$HOME/Library/Services/Check Lottie.workflow"

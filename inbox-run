@@ -69,7 +69,7 @@ def fix(original: Path, result: dict):
          "--output-format", "json", "--permission-mode", "acceptEdits",
          "--add-dir", str(LOTTIES), "--add-dir", str(TOOL), "--add-dir", str(HOME / "Downloads"),
          "--allowedTools", "Read", "Write", "Edit", "Glob", "Grep", "Skill",
-         f"Bash({TOOL}/lottie-check:*)", f"Bash({TOOL}/ios-harness/.build/release/Rasterize:*)",
+         f"Bash({TOOL}/lottie-check:*)", f"Bash({TOOL}/ios-harness/.build/release/Rasterize:*)", f"Bash({TOOL}/bin/Rasterize:*)",
          "Bash(python3:*)", "Bash(unzip:*)", "Bash(ls:*)", "Bash(cp:*)", "Bash(mkdir:*)", "Bash(sips:*)"],
         cwd=work, capture_output=True, text=True, timeout=1800)
     shutil.rmtree(work, ignore_errors=True)

@@ -3,7 +3,7 @@
 Each letter group (dozens of vector dots) becomes one image layer that keeps the letter's opacity
 keyframes. The precomp's null chain (bounce) and the root precomp layer (flicker) are untouched.
 
-usage: python3 fixes/flatten_led_example.py in.json out.json workdir ios-harness/.build/release/Rasterize
+usage: python3 fixes/flatten_led_example.py in.json out.json workdir bin/Rasterize (or ios-harness/.build/release/Rasterize)
 """
 import base64, copy, json, subprocess, sys
 from pathlib import Path

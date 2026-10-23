@@ -2,28 +2,42 @@
 
 Test `.lottie` / Lottie `.json` files against the players the Swish app ships, before uploading them.
 
-## Install (once per Mac, ~5 minutes)
+## Install
 
-Needs macOS, [Homebrew](https://brew.sh) and Xcode Command Line Tools (`xcode-select --install`). Put this folder wherever you like (e.g. `~/lottie-check`), then:
+### Prebuilt bundle (recommended, about 1 minute)
+
+Unzip `lottie-check-macos.zip` anywhere and run:
 
 ```bash
-./install.sh
+lottie-check/install.sh
 ```
+
+Needs macOS 13+ and nothing else on Apple Silicon. Intel Macs also need Java 17+; the installer gets it via Homebrew if it's there.
 
 The installer:
 
-1. Adds Java 17 and the Android SDK via Homebrew. You may be asked to accept Google's SDK licence.
-2. Builds both checkers.
-3. Self-tests on `samples/`.
-4. Adds the Finder Quick Action. Finder restarts once.
+1. Downloads Android's 200 MB runtime from Maven Central to `~/.lottie-check`, once, and verifies its checksum.
+2. Self-tests on two lotties it generates: one valid, one broken. Both checkers must agree.
+3. Adds the Finder Quick Action. Finder restarts once.
 
-Options:
+### From source (to change the tool)
 
-- `./install.sh --with-inbox` also watches `~/Lotties/inbox`.
-- `./install.sh --with-inbox --autofix` also lets [Claude Code](https://claude.com/claude-code) try to fix failing files, using your own Claude plan, capped at $2 per file.
+Needs [Homebrew](https://brew.sh) and Xcode Command Line Tools. Clone this repo and run `./install.sh`. It installs Java 17 and the Android SDK via Homebrew (you may be asked to accept Google's SDK licence) and builds both checkers. Only a source checkout can use `--emulator`.
+
+To build the bundle, run `./make-bundle.sh`. It writes `dist/lottie-check-macos.zip` (~145 MB) containing:
+
+- a universal iOS checker (macOS 13+)
+- the Robolectric check with its jars, running on plain `java`
+- a trimmed Java 17 runtime for Apple Silicon
+
+### Options (both)
+
+- `--with-inbox` also watches `~/Lotties/inbox`.
+- `--with-inbox --autofix` also lets [Claude Code](https://claude.com/claude-code) try to fix failing files, using your own Claude plan, capped at $2 per file.
+- `--check-only` sets up and self-tests without touching Finder, launchd or Claude (for CI).
 - `./uninstall.sh` removes everything the installer added to your Mac.
 
-Re-run `./install.sh` after pulling updates.
+Re-run `install.sh` after updating.
 
 ## Three ways in
 
