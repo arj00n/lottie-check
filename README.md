@@ -74,7 +74,7 @@ A typical new file takes 2–5 s and uses no tokens. Claude only runs on inbox f
 ## Fix tools (`fixes/`)
 
 - `pack_lottie.py in.json out.lottie`: pack a Figma JSON export. dotlottie-js 1.8.0 hollows Figma precomps, and lint flags that.
-- `flatten_led_example.py`: flattens dot-matrix LED text into per-letter image layers using `ios-harness/.build/release/Rasterize`.
+- `flatten_led_example.py`: flattens dot-matrix LED text into per-letter image layers using `bin/Rasterize` (`ios-harness/.build/release/Rasterize` in a source checkout).
 
 ## Keeping it in sync with Swish
 
@@ -84,4 +84,4 @@ When Swish bumps Lottie, update `ios-harness/Package.swift` (`exact:`) and `andr
 
 - Android SDK: Homebrew `android-commandlinetools`, JDK `openjdk@17`. Override with `ANDROID_SDK_ROOT` / `JAVA_HOME`.
 - Java can't download the Gradle distribution here, so the wrapper zip was placed in `~/.gradle/wrapper/dists/gradle-8.14.3-bin/*/` with curl. Repeat that if the Gradle cache is ever wiped.
-- The first Robolectric run downloads Android's runtime jar (~1 minute, once).
+- The first Robolectric run downloads Android's runtime jar (~1 minute, once): to `~/.m2` from source, to `~/.lottie-check` from the bundle. Robolectric can't load it from a path with spaces.
