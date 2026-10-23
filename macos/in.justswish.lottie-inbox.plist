@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>in.justswish.lottie-inbox</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>__LOTTIE_CHECK_DIR__/inbox-run</string>
+  </array>
+  <key>WatchPaths</key>
+  <array>
+    <string>__HOME__/Lotties/inbox</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__PATH__</string>
+    <key>LOTTIE_AUTOFIX</key>
+    <string>__AUTOFIX__</string>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>3</integer>
+  <key>StandardOutPath</key>
+  <string>__HOME__/Lotties/inbox.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Lotties/inbox.log</string>
+</dict>
+</plist>

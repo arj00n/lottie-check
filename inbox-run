@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""Check every lottie dropped into ~/Lotties/inbox. Started by launchd (see launchd/) whenever the inbox changes.
+
+  passed/      plays on iOS and Android within budget
+  needs-work/  fails, or plays but is over budget (originals, untouched)
+  fixed/       Claude's fix attempt for each needs-work file, plus a <name>.md note (when AUTOFIX is on)
+
+Results and reports: ~/lottie-check/out/index.html. Log: ~/Lotties/inbox.log.
+"""
+import json, os, shutil, subprocess, time
+from pathlib import Path
+
+AUTOFIX = os.environ.get("LOTTIE_AUTOFIX", "1") == "1"
+FIX_BUDGET_USD = os.environ.get("LOTTIE_FIX_BUDGET_USD", "2")
+FIX_MODEL = os.environ.get("LOTTIE_FIX_MODEL", "sonnet")
+
+HOME = Path.home()
+TOOL = Path(__file__).resolve().parent
+LOTTIES = HOME / "Lotties"
+INBOX, PASSED, NEEDS_WORK, FIXED = (LOTTIES / d for d in ("inbox", "passed", "needs-work", "fixed"))
+CLAUDE = Path(shutil.which("claude") or HOME / ".local/bin/claude")
+
+
+def log(msg):
+    print(time.strftime("%H:%M:%S"), msg, flush=True)
+
+
+def notify(title, text):
+    subprocess.run(["osascript", "-e", f"display notification {json.dumps(text[:200])} with title {json.dumps(title)}"],
+                   capture_output=True)
+
+
+def settled_files():
+    """Lotties in the inbox whose size has stopped changing (downloads and copies finished)."""
+    def snapshot():
+        return {p: p.stat().st_size for p in INBOX.iterdir()
+                if p.is_file() and not p.name.startswith(".") and p.suffix.lower() in (".lottie", ".json")}
+    before = snapshot()
+    time.sleep(2)
+    after = snapshot()
+    return sorted(p for p, size in after.items() if before.get(p) == size and size > 0)
+
+
+def move(path: Path, folder: Path) -> Path:
+    folder.mkdir(parents=True, exist_ok=True)
+    dest = folder / path.name
+    if dest.exists():
+        dest = folder / f"{path.stem}-{time.strftime('%Y%m%d-%H%M%S')}{path.suffix}"
+    shutil.move(str(path), dest)
+    return dest
+
+
+def fix(original: Path, result: dict):
+    FIXED.mkdir(parents=True, exist_ok=True)
+    target = FIXED / f"{original.stem}-fixed.lottie"
+    result_file = FIXED / f".{original.stem}-check.json"
+    result_file.write_text(json.dumps(result, indent=1))
+    work = FIXED / f".work-{original.stem}"
+    work.mkdir(exist_ok=True)
+    prompt = (f"Use the lottie-fix skill (~/.claude/skills/lottie-fix/SKILL.md) on {original}. "
+              f"Its lottie-check result is in {result_file}. Write the fixed file to {target} "
+              f"and the short report to {target}.md. Put every scratch file in {work}; "
+              f"do not create or change files under {TOOL}. Do not ask questions; if it can't be fixed, "
+              f"write only the report explaining why.")
+    log(f"autofix {original.name} with {FIX_MODEL}, budget ${FIX_BUDGET_USD}")
+    started = time.time()
+    proc = subprocess.run(
+        [str(CLAUDE), "-p", prompt, "--model", FIX_MODEL, "--max-budget-usd", FIX_BUDGET_USD,
+         "--output-format", "json", "--permission-mode", "acceptEdits",
+         "--add-dir", str(LOTTIES), "--add-dir", str(TOOL), "--add-dir", str(HOME / "Downloads"),
+         "--allowedTools", "Read", "Write", "Edit", "Glob", "Grep", "Skill",
+         f"Bash({TOOL}/lottie-check:*)", f"Bash({TOOL}/ios-harness/.build/release/Rasterize:*)",
+         "Bash(python3:*)", "Bash(unzip:*)", "Bash(ls:*)", "Bash(cp:*)", "Bash(mkdir:*)", "Bash(sips:*)"],
+        cwd=work, capture_output=True, text=True, timeout=1800)
+    shutil.rmtree(work, ignore_errors=True)
+    try:
+        summary = json.loads(proc.stdout)
+        cost = f"${summary.get('total_cost_usd', 0):.2f}"
+        text = summary.get("result", "")
+    except json.JSONDecodeError:
+        cost, text = "unknown cost", proc.stdout
+    log(f"autofix {original.name}: agent finished in {(time.time() - started) / 60:.1f} min, {cost}")
+    (FIXED / f".{original.stem}-agent.log").write_text(text + proc.stderr)
+    if target.exists():
+        check = subprocess.run([str(TOOL / "lottie-check"), str(target), "--no-open", "--json"],
+                               capture_output=True, text=True)
+        status = json.loads(check.stdout)[0]["status"] if check.stdout.strip() else "fail"
+        log(f"autofix {original.name}: {target.name} {status}")
+        return status
+    log(f"autofix {original.name}: no fix written")
+    return None
+
+
+def main():
+    for folder in (INBOX, PASSED, NEEDS_WORK, FIXED):
+        folder.mkdir(parents=True, exist_ok=True)
+    while True:
+        files = settled_files()
+        if not files:
+            return
+        log(f"checking {', '.join(p.name for p in files)}")
+        proc = subprocess.run([str(TOOL / "lottie-check"), *map(str, files), "--no-open", "--json", "--notify"],
+                              capture_output=True, text=True)
+        results = {r["path"]: r for r in json.loads(proc.stdout)} if proc.stdout.strip() else {}
+        needs_work = []
+        for path in files:
+            r = results.get(str(path.resolve()))
+            if r is None:
+                log(f"{path.name}: no result, leaving in inbox. {proc.stderr[-300:]}")
+                continue
+            if r["status"] == "pass":
+                move(path, PASSED)
+            else:
+                needs_work.append((move(path, NEEDS_WORK), r))
+            log(f"{path.name}: {r['status']}")
+        if not results:
+            return  # don't spin on files the checker can't read
+        if needs_work:
+            page = TOOL / "out/index.html" if len(results) > 1 else Path(needs_work[0][1]["report"])
+            subprocess.run(["open", str(page)])
+        if AUTOFIX:
+            for original, r in needs_work:
+                status = fix(original, r)
+                if status in ("pass", "warn"):
+                    notify(f"Fixed {original.name}", f"{original.stem}-fixed.lottie {status}s · see ~/Lotties/fixed")
+                else:
+                    notify(f"Couldn't fix {original.name}", "See the note in ~/Lotties/fixed")
+
+
+if __name__ == "__main__":
+    main()

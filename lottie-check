@@ -1,0 +1,521 @@
+#!/usr/bin/env python3
+"""Test .lottie / Lottie .json files against the players Swish ships, before uploading them.
+
+  lottie-check FILE [FILE ...] [--frames 0,60,120] [--no-ios] [--no-android] [--emulator]
+                               [--force] [--notify] [--json] [--no-open] [--out DIR]
+
+For each file:
+  1. lint     structural problems players disagree on (hollow layers, missing images, bad refs)
+              plus budgets (vector path count, decoded image memory)
+  2. iOS      lottie-ios 4.5.0, loaded the way lottie-react-native 7.3.5 loads a cached file://
+              (headless on this Mac, Core Animation engine, see ios-harness/)
+  3. Android  lottie-android 6.5.2 under Robolectric (real parser, real Skia, no emulator), with a
+              per-frame draw-cost bench. --emulator uses the emulator app instead, loading over http
+              via setAnimationFromUrl like Swish, and leaves the file looping on screen.
+Results are cached by file content: an unchanged file is not re-tested unless --force.
+Writes out/<name>-<hash>/report.html per file, out/index.html for multi-file runs, and opens it.
+"""
+import argparse, base64, fcntl, hashlib, html, http.server, json, os, re, shutil, socket, subprocess, sys
+import tempfile, threading, time, zipfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+# Homebrew lives in /opt/homebrew on Apple Silicon and /usr/local on Intel Macs
+BREW = next((p for p in (Path("/opt/homebrew"), Path("/usr/local")) if (p / "bin/brew").exists()), Path("/opt/homebrew"))
+SDK = Path(os.environ.get("ANDROID_SDK_ROOT") or BREW / "share/android-commandlinetools")
+JAVA_HOME = os.environ.get("LOTTIE_JAVA_HOME") or str(BREW / "opt/openjdk@17")
+ADB = str(SDK / "platform-tools/adb")
+AVD = "lottie_check"
+SYSTEM_IMAGE = "system-images;android-35;google_apis;arm64-v8a"
+PKG = "in.justswish.lottiecheck"
+APK = ROOT / "android/app/build/outputs/apk/debug/app-debug.apk"
+IOS_BIN = ROOT / "ios-harness/.build/release/LottieCheckIOS"
+REQUIRED_LAYER_KEYS = ("ty", "ip", "op", "st", "ks")
+# Bump when checks change so cached results are recomputed.
+TOOL_VERSION = "2"
+
+# Budgets, from Swish's After Effects banners (GourmetHMnoSKU: 35 vector paths, ~8 MB of images).
+MAX_VECTOR_PATHS = 250
+MAX_IMAGE_MB = 24
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+def env():
+    e = dict(os.environ, JAVA_HOME=JAVA_HOME, ANDROID_SDK_ROOT=str(SDK), ANDROID_HOME=str(SDK))
+    e["PATH"] = f"{JAVA_HOME}/bin:/usr/bin:/bin:/usr/sbin:/sbin:{e.get('PATH', '')}"
+    return e
+
+
+def newest_mtime(folder: Path, skip=("build", ".build", ".gradle", ".installed", "local.properties")):
+    return max(p.stat().st_mtime for p in folder.rglob("*") if p.is_file() and not set(skip) & set(p.parts))
+
+
+# ---------------------------------------------------------------- lint
+
+def load_animation(path: Path):
+    """Return (animation json, {packed image name: bytes})."""
+    if path.suffix.lower() == ".json":
+        return json.loads(path.read_text()), {}
+    with zipfile.ZipFile(path) as z:
+        names = z.namelist()
+        anims = [n for n in names if re.match(r"(animations|a)/.+\.json$", n)]
+        if not anims:
+            raise ValueError("no animations/*.json inside the .lottie")
+        images = {Path(n).name: z.read(n) for n in names if re.match(r"(images|i)/.+", n) and not n.endswith("/")}
+        return json.loads(z.read(anims[0])), images
+
+
+def image_size(data: bytes):
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        chunk = data[12:16]
+        if chunk == b"VP8X":
+            return 1 + int.from_bytes(data[24:27], "little"), 1 + int.from_bytes(data[27:30], "little")
+        if chunk == b"VP8L":
+            v = int.from_bytes(data[21:25], "little")
+            return (v & 0x3FFF) + 1, ((v >> 14) & 0x3FFF) + 1
+        if chunk == b"VP8 ":
+            return int.from_bytes(data[26:28], "little") & 0x3FFF, int.from_bytes(data[28:30], "little") & 0x3FFF
+    if data[:2] == b"\xff\xd8":
+        i = 2
+        while i < len(data) - 9:
+            if data[i] == 0xFF and data[i + 1] in (0xC0, 0xC1, 0xC2):
+                return int.from_bytes(data[i + 7:i + 9], "big"), int.from_bytes(data[i + 5:i + 7], "big")
+            i += 2 + int.from_bytes(data[i + 2:i + 4], "big")
+    return 0, 0
+
+
+def count_paths(items):
+    return sum((1 if it.get("ty") in ("sh", "rc", "el", "sr") else 0) + count_paths(it.get("it", [])) for it in items)
+
+
+def lint(path: Path):
+    """Return {"errors", "warnings", "info"}."""
+    errors, warnings = [], []
+    try:
+        anim, packed = load_animation(path)
+    except Exception as e:
+        return {"errors": [f"cannot read file: {e}"], "warnings": [], "info": {}}
+
+    assets = {a.get("id"): a for a in anim.get("assets", [])}
+    comps = [("root", anim.get("layers", []))] + [(a["id"], a["layers"]) for a in anim.get("assets", []) if "layers" in a]
+    paths_by_comp = {}
+    for where, layers in comps:
+        hollow = [i for i, l in enumerate(layers) if not all(k in l for k in REQUIRED_LAYER_KEYS)]
+        if hollow:
+            errors.append(f"{where}: {len(hollow)} of {len(layers)} layers are hollow (missing ty/ip/op/st/ks); "
+                          "lottie-ios and lottie-android refuse the whole file, ThorVG silently drops them. "
+                          "Repack from the exported JSON with fixes/pack_lottie.py")
+        for l in layers:
+            ref = l.get("refId")
+            if ref is not None and ref not in assets:
+                errors.append(f"{where}: layer {l.get('nm') or l.get('ind')} references missing asset {ref}")
+        paths_by_comp[where] = sum(count_paths(l.get("shapes", [])) for l in layers)
+
+    image_px = 0
+    for a in assets.values():
+        if "layers" in a or "p" not in a:
+            continue
+        p = str(a["p"])
+        if p.startswith("data:"):
+            w, h = image_size(base64.b64decode(p.split(",", 1)[1]))
+        elif path.suffix.lower() == ".json":
+            warnings.append(f"image {a['id']} is external ({a.get('u', '')}{p}); a bare .json can't carry it")
+            continue
+        elif Path(p).name not in packed:
+            errors.append(f"image {a['id']} -> {p} is not packed in the .lottie")
+            continue
+        else:
+            w, h = image_size(packed[Path(p).name])
+        image_px += w * h
+
+    vector_paths = sum(paths_by_comp.values())
+    if vector_paths > MAX_VECTOR_PATHS:
+        worst = max(paths_by_comp, key=paths_by_comp.get)
+        warnings.append(f"heavy: {vector_paths} vector paths (budget {MAX_VECTOR_PATHS}, AE banners ~35), "
+                        f"{paths_by_comp[worst]} of them in {worst}. Flatten static or opacity-only groups to images")
+    image_mb = image_px * 4 / 1e6
+    if image_mb > MAX_IMAGE_MB:
+        warnings.append(f"heavy: images decode to {image_mb:.0f} MB (budget {MAX_IMAGE_MB} MB)")
+
+    info = {
+        "size": f"{anim.get('w')}x{anim.get('h')}",
+        "frames": f"{anim.get('ip')}-{anim.get('op')} @ {anim.get('fr')}fps",
+        "vector paths": vector_paths,
+        "images": f"{sum(1 for a in assets.values() if 'p' in a)} ({image_mb:.0f} MB decoded)",
+        "generator": (anim.get("meta") or {}).get("g", "") or (anim.get("nm") or ""),
+    }
+    span = (anim.get("ip", 0), anim.get("op", 0))
+    return {"errors": errors, "warnings": warnings, "info": info, "span": span}
+
+
+def default_frames(span):
+    ip, op = span
+    length = max(1, int(op) - int(ip))
+    return sorted({int(ip) + length * k // 6 for k in (0, 2, 4)})
+
+
+# ---------------------------------------------------------------- iOS (headless lottie-ios 4.5.0)
+
+def ios_binary():
+    harness = ROOT / "ios-harness"
+    if not IOS_BIN.exists() or newest_mtime(harness) > IOS_BIN.stat().st_mtime:
+        log("building iOS harness")
+        subprocess.run(["swift", "build", "-c", "release", "-q"], cwd=harness, check=True, env=env())
+    return IOS_BIN
+
+
+def run_ios(path: Path, out: Path, frames):
+    proc = subprocess.run([str(IOS_BIN), str(path), str(out)] + [str(f) for f in frames],
+                          capture_output=True, text=True, timeout=300)
+    lines = (proc.stdout + proc.stderr).splitlines()
+    result = next((l for l in lines if l.startswith("RESULT")), "RESULT FAIL harness crashed")
+    info = next((l[5:] for l in lines if l.startswith("INFO ")), "")
+    notes = [l for l in lines if not l.startswith(("RESULT", "INFO "))][:20]
+    ok = result == "RESULT OK"
+    return {"ok": ok, "detail": info if ok else result[12:], "notes": notes}
+
+
+# ---------------------------------------------------------------- Android under Robolectric (default)
+
+def run_android_robolectric(jobs):
+    """jobs: list of (path, out dir, frames). Returns {path: result}. One JVM for the whole batch."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        staged = {}
+        listing = []
+        for path, out, frames in jobs:
+            # unique staged name so two different files with the same name don't collide
+            name = f"{out.name}{path.suffix}"
+            shutil.copy(path, tmp / name)
+            staged[str(tmp / name)] = (path, out)
+            listing.append(f"{tmp / name}\t{','.join(map(str, frames))}")
+        (tmp / "files.tsv").write_text("\n".join(listing))
+        renders = tmp / "renders"
+        renders.mkdir()
+        proc = subprocess.run(["./gradlew", ":app:testDebugUnitTest", "-q", f"-PlottieList={tmp / 'files.tsv'}",
+                               f"-PlottieOut={renders}", "-PlottieBench=true"],
+                              cwd=ROOT / "android", capture_output=True, text=True, env=env())
+        results_file = renders / "android-results.txt"
+        lines = results_file.read_text().splitlines() if results_file.exists() else []
+        results = {}
+        for line in lines:
+            m = re.match(r"RESULT (OK|FAIL) (.+?) :: (.*)$", line)
+            if not m or m.group(2) not in staged:
+                continue
+            path, out = staged[m.group(2)]
+            parts = m.group(3).split(" :: ")
+            for png in (renders / Path(m.group(2)).name).glob("android-f*.png"):
+                shutil.move(str(png), out / png.name)
+            results[path] = {"ok": m.group(1) == "OK", "detail": parts[0], "notes": parts[1:]}
+        for path, out, _ in jobs:
+            results.setdefault(path, {"ok": False, "detail": "Robolectric run crashed",
+                                      "notes": (proc.stdout + proc.stderr).strip().splitlines()[-8:]})
+        return results
+
+
+# ---------------------------------------------------------------- Android on the emulator (--emulator)
+
+def adb(*args, check=True, **kw):
+    return subprocess.run([ADB, *args], check=check, capture_output=True, text=kw.pop("text", True), env=env(), **kw)
+
+
+def ensure_emulator():
+    if any(l.endswith("\tdevice") and l.startswith("emulator-") for l in adb("devices").stdout.splitlines()):
+        return
+    avds = subprocess.run([str(SDK / "emulator/emulator"), "-list-avds"], capture_output=True, text=True, env=env()).stdout.split()
+    if AVD not in avds:
+        log(f"creating AVD {AVD}")
+        subprocess.run([str(SDK / "cmdline-tools/latest/bin/avdmanager"), "create", "avd", "-n", AVD,
+                        "-k", SYSTEM_IMAGE, "-d", "pixel_7"], input="no\n", text=True, check=True,
+                       capture_output=True, env=env())
+    log("booting emulator (first boot takes a minute)")
+    # -gpu host: on the default software renderer every file looks laggy
+    subprocess.Popen([str(SDK / "emulator/emulator"), "-avd", AVD, "-no-snapshot-save", "-no-boot-anim", "-gpu", "host"],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env(), start_new_session=True)
+    adb("wait-for-device", timeout=180)
+    deadline = time.time() + 240
+    while adb("shell", "getprop", "sys.boot_completed", check=False).stdout.strip() != "1":
+        if time.time() > deadline:
+            raise RuntimeError("emulator did not finish booting")
+        time.sleep(2)
+
+
+def ensure_apk():
+    if not APK.exists() or newest_mtime(ROOT / "android") > APK.stat().st_mtime:
+        log("building Android app")
+        subprocess.run(["./gradlew", "assembleDebug", "-q"], cwd=ROOT / "android", check=True, env=env())
+    stamp = ROOT / "android/.installed"
+    installed = PKG in adb("shell", "pm", "list", "packages", PKG, check=False).stdout
+    if not installed or not stamp.exists() or APK.stat().st_mtime > float(stamp.read_text() or 0):
+        adb("install", "-r", str(APK))
+        stamp.write_text(str(APK.stat().st_mtime))
+
+
+def serve(directory: Path):
+    """Serve directory on a free port; the emulator reaches it through `adb reverse`."""
+    handler = lambda *a, **k: http.server.SimpleHTTPRequestHandler(*a, directory=str(directory), **k)
+    http.server.SimpleHTTPRequestHandler.log_message = lambda *a: None
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    adb("reverse", f"tcp:{port}", f"tcp:{port}")
+    return server, port
+
+
+def wait_log(pattern, timeout=60):
+    deadline = time.time() + timeout
+    rx = re.compile(pattern)
+    while time.time() < deadline:
+        for line in adb("logcat", "-d", "-s", "LOTTIE_CHECK:I", "-v", "raw").stdout.splitlines():
+            if rx.search(line):
+                return line
+        time.sleep(0.3)
+    return None
+
+
+def run_android_emulator(path: Path, out: Path, frames, serve_dir: Path, port: int):
+    name = f"{out.name}{path.suffix}"
+    shutil.copy(path, serve_dir / name)
+    url = f"http://127.0.0.1:{port}/{name}"
+    activity = f"{PKG}/.MainActivity"
+    adb("shell", "am", "force-stop", PKG)
+    adb("logcat", "-c")
+    adb("shell", "am", "start", "-W", "-n", activity, "--es", "url", url)
+    line = wait_log(r"^(LOADED|FAILED)")
+    notes = [l[8:] for l in adb("logcat", "-d", "-s", "LOTTIE_CHECK:I", "-v", "raw").stdout.splitlines() if l.startswith("WARNING")]
+    if not line or line.startswith("FAILED"):
+        return {"ok": False, "detail": (line or "FAILED no response from app")[7:], "notes": notes}
+    m = re.search(r"size=(\d+)x(\d+)", line)
+    size = (int(m.group(1)), int(m.group(2))) if m else None
+    for f in frames:
+        adb("logcat", "-c")
+        adb("shell", "am", "start", "-n", activity, "--ei", "frame", str(f))
+        wait_log(rf"^FRAME {f}$", timeout=15)
+        shot = out / f"android-f{f}.png"
+        shot.write_bytes(adb("exec-out", "screencap", "-p", text=False).stdout)
+        if size:
+            # FIT_CENTER on a full-screen view: the animation is the centred band of the screen width
+            screen_w = int(re.search(r"(\d+)x\d+", adb("shell", "wm", "size").stdout).group(1))
+            band_h = round(screen_w * size[1] / size[0])
+            subprocess.run(["sips", "-c", str(band_h), str(screen_w), str(shot)], capture_output=True)
+    adb("logcat", "-c")
+    adb("shell", "am", "start", "-n", activity, "--ez", "bench", "true")
+    bench = wait_log(r"^BENCH", timeout=300)
+    adb("shell", "am", "start", "-n", activity, "--ez", "play", "true")
+    notes.append(f"draw cost per frame: {bench[6:] if bench else 'bench timed out'}")
+    return {"ok": True, "detail": line[7:], "notes": notes}
+
+
+# ---------------------------------------------------------------- reports
+
+CSS = """
+:root{--bg:#fafafa;--fg:#111;--muted:#666;--card:#fff;--line:#e5e5e5;--okbg:#d7f5dd;--okfg:#0a5a1c;--failbg:#fde0de;--failfg:#8a1c12;--warnbg:#fff1c7;--warnfg:#6b4e00}
+@media (prefers-color-scheme:dark){:root{--bg:#111;--fg:#eee;--muted:#999;--card:#1a1a1a;--line:#2a2a2a;--okbg:#123d1d;--okfg:#9be3ad;--failbg:#4a1713;--failfg:#f5aaa2;--warnbg:#3d3010;--warnfg:#f0d68a}}
+body{margin:0;padding:24px 16px;background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,system-ui,sans-serif}
+h1{font-size:18px;margin:0 0 4px} h2{font-size:14px;margin:0 0 6px} .mono{font:12px ui-monospace,monospace;color:var(--muted);margin:0}
+a{color:inherit}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;margin:16px 0}
+.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:12px} ul{margin:6px 0 0;padding-left:18px;font-size:12px}
+.b{font-size:11px;padding:1px 6px;border-radius:4px;margin-left:4px;white-space:nowrap}
+.ok{background:var(--okbg);color:var(--okfg)} .fail{background:var(--failbg);color:var(--failfg)} .warn{background:var(--warnbg);color:var(--warnfg)} .skip{background:var(--line);color:var(--muted)}
+table{border-collapse:collapse;width:100%} th{text-align:left;font-weight:500;color:var(--muted);padding:8px 8px 8px 0;vertical-align:top}
+td{padding:6px 4px;vertical-align:top;border-top:1px solid var(--line)} .frames td{width:50%;border:0}
+img{width:100%;border:1px solid var(--line);border-radius:6px;display:block}
+.empty{height:120px;display:grid;place-items:center;color:var(--muted);border:1px dashed var(--line);border-radius:6px}
+.scroll{overflow-x:auto} .nowrap{white-space:nowrap}
+"""
+
+
+def badge(state, label=None):
+    text = label or {"ok": "plays", "fail": "fails", "warn": "warnings", "skip": "skipped"}[state]
+    return f'<span class="b {state}">{text}</span>'
+
+
+def check_state(r):
+    if r is None:
+        return "skip"
+    return "ok" if r["ok"] else "fail"
+
+
+def write_report(result, out: Path):
+    lint_res, ios, android, frames = result["lint"], result["ios"], result["android"], result["frames"]
+    lint_state = "fail" if lint_res["errors"] else "warn" if lint_res["warnings"] else "ok"
+
+    def section(title, state, detail, notes, label=None):
+        items = "".join(f"<li>{html.escape(n)}</li>" for n in notes)
+        return (f"<div class='card'><h2>{title} {badge(state, label)}</h2><p class='mono'>{html.escape(detail or '')}</p>"
+                f"{'<ul>' + items + '</ul>' if items else ''}</div>")
+
+    rows = ""
+    for f in frames:
+        cells = ""
+        for prefix, res in (("ios", ios), ("android", android)):
+            img = out / f"{prefix}-f{f}.png"
+            # embedded so the report survives being moved or shared
+            src = f"data:image/png;base64,{base64.b64encode(img.read_bytes()).decode()}" if res and res["ok"] and img.exists() else None
+            cells += f"<td>{f'<img src={src}>' if src else '<div class=empty>—</div>'}</td>"
+        rows += f"<tr><th>frame {f}</th>{cells}</tr>"
+    lint_items = [f"error: {e}" for e in lint_res["errors"]] + [f"warning: {w}" for w in lint_res["warnings"]]
+    page = f"""<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>{html.escape(result['name'])}</title><style>{CSS}</style>
+<h1>{html.escape(result['name'])}</h1>
+<p class=mono>{html.escape(' · '.join(f'{k} {v}' for k, v in lint_res['info'].items()))}</p>
+<div class=cards>
+{section('Lint', lint_state, '', lint_items, {'ok': 'clean', 'warn': 'warnings', 'fail': 'issues'}[lint_state])}
+{section('iOS · lottie-ios 4.5.0', check_state(ios), ios and ios['detail'], ios['notes'] if ios else [])}
+{section(f"Android · lottie-android 6.5.2 · {result['android_via']}", check_state(android), android and android['detail'], android['notes'] if android else [])}
+</div>
+<table class=frames><tr><th></th><th>iOS</th><th>Android</th></tr>{rows}</table>"""
+    (out / "report.html").write_text(page)
+
+
+def write_index(results, out_root: Path):
+    rows = ""
+    for r in results:
+        cost = next((n.split(": ", 1)[1] for n in (r["android"] or {}).get("notes", []) if n.startswith("draw cost")), "")
+        p50 = re.search(r"p50=([\d.]+ms)", cost)
+        worst = re.search(r"max=([\d.]+ms)", cost)
+        status_label = {"pass": "passes", "warn": "warnings", "fail": "fails"}[r["status"]]
+        issues = r["lint"]["errors"] + r["lint"]["warnings"]
+        note = issues[0] + (f" (+{len(issues) - 1} more)" if len(issues) > 1 else "") if issues else ""
+        rows += (f"<tr><td><a href='{html.escape(r['report_rel'])}'>{html.escape(r['name'])}</a></td>"
+                 f"<td>{badge({'pass': 'ok', 'warn': 'warn', 'fail': 'fail'}[r['status']], status_label)}</td>"
+                 f"<td>{badge(check_state(r['ios']))}</td><td>{badge(check_state(r['android']))}</td>"
+                 f"<td class='mono nowrap'>{p50.group(1) if p50 else ''}{' / ' + worst.group(1) if worst else ''}</td>"
+                 f"<td class=mono>{html.escape(note)}</td></tr>")
+    passed = sum(r["status"] != "fail" for r in results)
+    page = f"""<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>Lottie check</title><style>{CSS}</style>
+<h1>Lottie check</h1><p class=mono>{passed} of {len(results)} play on both · {time.strftime('%d %b %Y %H:%M')}</p>
+<div class=scroll><table><tr><th>File</th><th>Result</th><th>iOS</th><th>Android</th><th>Draw p50 / worst</th><th>Notes</th></tr>{rows}</table></div>"""
+    (out_root / "index.html").write_text(page)
+    return out_root / "index.html"
+
+
+def notify(results):
+    failed = [r["name"] for r in results if r["status"] == "fail"]
+    warned = [r["name"] for r in results if r["status"] == "warn"]
+    if failed:
+        title, text = f"✗ {len(failed)} of {len(results)} lotties fail", ", ".join(failed)
+    elif warned:
+        title, text = f"! {len(results)} play, {len(warned)} with warnings", ", ".join(warned)
+    else:
+        title, text = f"✓ {len(results)} lottie{'s' if len(results) > 1 else ''} play on iOS and Android", ", ".join(r["name"] for r in results)
+    script = f"display notification {json.dumps(text[:200])} with title {json.dumps(title)}"
+    subprocess.run(["osascript", "-e", script], capture_output=True)
+
+
+# ---------------------------------------------------------------- main
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("files", nargs="+", type=Path)
+    ap.add_argument("--frames", help="comma-separated frames to capture (default: start, 1/3 and 2/3 of each file)")
+    ap.add_argument("--no-ios", action="store_true")
+    ap.add_argument("--no-android", action="store_true")
+    ap.add_argument("--emulator", action="store_true", help="check Android on the emulator instead of Robolectric")
+    ap.add_argument("--force", action="store_true", help="re-test files even if cached")
+    ap.add_argument("--notify", action="store_true", help="post a macOS notification with the outcome")
+    ap.add_argument("--json", action="store_true", help="print results as JSON on stdout")
+    ap.add_argument("--no-open", action="store_true")
+    ap.add_argument("--out", type=Path, default=ROOT / "out")
+    a = ap.parse_args()
+    a.out.mkdir(parents=True, exist_ok=True)
+    signature = f"v{TOOL_VERSION} frames={a.frames} ios={not a.no_ios} android={'' if a.no_android else 'emu' if a.emulator else 'robo'}"
+
+    # one run at a time: Finder, the inbox watcher and the terminal share the Gradle build and emulator
+    lock = open(a.out / ".lock", "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+
+    results, todo = [], []
+    for path in a.files:
+        path = path.expanduser().resolve()
+        if not path.is_file() or path.suffix.lower() not in (".lottie", ".json"):
+            log(f"skipping {path.name}: not a .lottie or .json file")
+            continue
+        digest = hashlib.sha1(path.read_bytes()).hexdigest()[:10]
+        out = a.out / f"{path.stem}-{digest}"
+        cached = out / "result.json"
+        if not a.force and cached.exists():
+            prev = json.loads(cached.read_text())
+            if prev.get("signature") == signature:
+                prev["path"] = str(path)
+                results.append(prev)
+                log(f"{path.name}: cached ({prev['status']})")
+                continue
+        out.mkdir(parents=True, exist_ok=True)
+        for old in out.glob("*-f*.png"):
+            old.unlink()
+        lint_res = lint(path)
+        frames = [int(f) for f in a.frames.split(",")] if a.frames else default_frames(lint_res.get("span", (0, 1)))
+        todo.append({"path": path, "out": out, "name": path.name, "frames": frames, "lint": lint_res,
+                     "ios": None, "android": None, "signature": signature,
+                     "android_via": "emulator" if a.emulator else "Robolectric"})
+
+    if todo and not a.no_ios:
+        ios_binary()
+        for r in todo:
+            r["ios"] = run_ios(r["path"], r["out"], r["frames"])
+    if todo and not a.no_android:
+        if a.emulator:
+            ensure_emulator()
+            ensure_apk()
+            serve_dir = a.out / ".serve"
+            serve_dir.mkdir(exist_ok=True)
+            server, port = serve(serve_dir)
+            for r in todo:
+                r["android"] = run_android_emulator(r["path"], r["out"], r["frames"], serve_dir, port)
+            server.shutdown()
+            adb("reverse", "--remove-all", check=False)
+        else:
+            android = run_android_robolectric([(r["path"], r["out"], r["frames"]) for r in todo])
+            for r in todo:
+                r["android"] = android[r["path"]]
+
+    for r in todo:
+        broken = r["lint"]["errors"] or (r["ios"] and not r["ios"]["ok"]) or (r["android"] and not r["android"]["ok"])
+        r["status"] = "fail" if broken else "warn" if r["lint"]["warnings"] else "pass"
+        write_report(r, r["out"])
+        r["report"] = str(r["out"] / "report.html")
+        r["report_rel"] = f"{r['out'].name}/report.html"
+        r["path"] = str(r["path"])
+        r["out"] = str(r["out"])
+        Path(r["out"], "result.json").write_text(json.dumps(r, indent=1))
+        results.append(r)
+
+    for r in results:
+        log(f"\n{r['name']}  [{r['status']}]")
+        for e in r["lint"]["errors"]:
+            log(f"  lint     ✗ {e}")
+        for w in r["lint"]["warnings"]:
+            log(f"  lint     ! {w}")
+        for label, key in (("iOS", "ios"), ("Android", "android")):
+            res = r[key]
+            if res:
+                log(f"  {label:<8} {'✓' if res['ok'] else '✗'} {res['detail']}")
+                for n in res["notes"]:
+                    log(f"           {n}")
+        log(f"  report   {r['report']}")
+
+    if not results:
+        sys.exit(2)
+    page = write_index(results, a.out) if len(results) > 1 else Path(results[0]["report"])
+    (a.out / "last-run.json").write_text(json.dumps(results, indent=1))
+    if a.json:
+        print(json.dumps(results, indent=1))
+    if a.notify:
+        notify(results)
+    if not a.no_open:
+        subprocess.run(["open", str(page)])
+    sys.exit(1 if any(r["status"] == "fail" for r in results) else 0)
+
+
+if __name__ == "__main__":
+    main()

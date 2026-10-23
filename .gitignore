@@ -1,0 +1,10 @@
+out/
+ios-harness/.build/
+ios-harness/.swiftpm/
+android/.gradle/
+android/.kotlin/
+android/build/
+android/app/build/
+android/local.properties
+android/.installed
+.DS_Store
