@@ -98,7 +98,7 @@ if (( WITH_INBOX )); then
       -e "s#__PATH__#$CLAUDE_DIR:$BREW/bin:/usr/bin:/bin:/usr/sbin:/sbin#g" \
       "$DIR/macos/in.justswish.lottie-inbox.plist" > "$AGENT"
   launchctl bootstrap "gui/$(id -u)" "$AGENT"
-  echo "Drop files into ~/Lotties/inbox → sorted into passed/ or needs-work/$( (( AUTOFIX )) && echo ', fixes in fixed/ (max \$2 each)')"
+  echo "Drop files into ~/Lotties/inbox → sorted into passed/ or needs-work/$( (( AUTOFIX )) && echo ', fixes in fixed/ (max $2 each)')"
 fi
 
 step "Done"
