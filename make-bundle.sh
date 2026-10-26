@@ -81,5 +81,6 @@ cp -R "$DIR/macos" "$DIR/claude-skill" "$DIR/fixes" "$DIR/selftest" "$OUT/"
 git -C "$DIR" describe --always --dirty > "$OUT/VERSION"
 
 step "Zip"
-(cd "$DIR/dist" && ditto -c -k --keepParent lottie-check lottie-check-macos.zip)
+# --norsrc/--noextattr: no ._ metadata files in the zip
+(cd "$DIR/dist" && ditto -c -k --norsrc --noextattr --noqtn --keepParent lottie-check lottie-check-macos.zip)
 du -sh "$OUT" "$DIR/dist/lottie-check-macos.zip"
