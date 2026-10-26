@@ -34,7 +34,7 @@ BUNDLE = (ROOT / "bin/LottieCheckIOS").exists()
 IOS_BIN = ROOT / "bin/LottieCheckIOS" if BUNDLE else ROOT / "ios-harness/.build/release/LottieCheckIOS"
 REQUIRED_LAYER_KEYS = ("ty", "ip", "op", "st", "ks")
 # Bump when checks change so cached results are recomputed.
-TOOL_VERSION = "3"
+TOOL_VERSION = "4"
 
 # Budgets, from Swish's After Effects banners (GourmetHMnoSKU: 35 vector paths, ~8 MB of images).
 MAX_VECTOR_PATHS = 250

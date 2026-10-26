@@ -4,6 +4,7 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Picture
+import android.widget.ImageView
 import androidx.test.core.app.ApplicationProvider
 import com.airbnb.lottie.LottieComposition
 import com.airbnb.lottie.LottieCompositionFactory
@@ -60,6 +61,11 @@ class RobolectricCheck {
         setComposition(composition)
         setBounds(0, 0, w, h)
       }
+      // Hosted in a view like LottieAnimationView: lottie-android decodes base64 images embedded in a
+      // .json lazily through the drawable's view, and silently skips them without one (.lottie images
+      // are decoded up front, so they render either way). Drawables hold their view weakly, so `host`
+      // must stay reachable until the last draw.
+      val host = ImageView(context).apply { setImageDrawable(drawable) }
       for (f in frames) {
         val bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bitmap)
@@ -70,6 +76,7 @@ class RobolectricCheck {
       }
       val perf = if (bench) " :: draw cost per frame: ${bench(composition, drawable, w, h)}" else ""
       val warnings = composition.warnings.joinToString("") { " :: WARNING $it" }
+      java.lang.ref.Reference.reachabilityFence(host)
       results.appendText("RESULT OK $path :: size=${w}x$h frames=${composition.startFrame.toInt()}-${composition.endFrame.toInt()} fps=${composition.frameRate}$perf$warnings\n")
       } catch (e: Throwable) {
         results.appendText("RESULT FAIL $path :: render crashed: ${e.javaClass.simpleName}: ${e.message}\n")
