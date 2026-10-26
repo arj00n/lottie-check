@@ -34,11 +34,13 @@ BUNDLE = (ROOT / "bin/LottieCheckIOS").exists()
 IOS_BIN = ROOT / "bin/LottieCheckIOS" if BUNDLE else ROOT / "ios-harness/.build/release/LottieCheckIOS"
 REQUIRED_LAYER_KEYS = ("ty", "ip", "op", "st", "ks")
 # Bump when checks change so cached results are recomputed.
-TOOL_VERSION = "2"
+TOOL_VERSION = "3"
 
 # Budgets, from Swish's After Effects banners (GourmetHMnoSKU: 35 vector paths, ~8 MB of images).
 MAX_VECTOR_PATHS = 250
 MAX_IMAGE_MB = 24
+# Mattes and masks each make lottie-android draw into an offscreen buffer every frame (GourmetHMnoSKU: 2).
+MAX_OFFSCREEN_PASSES = 16
 
 
 def log(msg):
@@ -103,6 +105,15 @@ def lint(path: Path):
     except Exception as e:
         return {"errors": [f"cannot read file: {e}"], "warnings": [], "info": {}}
 
+    if path.suffix.lower() == ".lottie":
+        with zipfile.ZipFile(path) as z:
+            # Figma's .lottie export stores images uncompressed but with a data descriptor (flag bit 3);
+            # java.util.zip.ZipInputStream, which lottie-android reads every .lottie with, rejects that.
+            bad = [i.filename for i in z.infolist() if i.compress_type == zipfile.ZIP_STORED and i.flag_bits & 0x08]
+        if bad:
+            errors.append(f"{len(bad)} zip entries are stored uncompressed with a data descriptor (e.g. {bad[0]}); "
+                          "lottie-android can't open the file (ZipException). Rezip with fixes/rezip_lottie.py")
+
     assets = {a.get("id"): a for a in anim.get("assets", [])}
     comps = [("root", anim.get("layers", []))] + [(a["id"], a["layers"]) for a in anim.get("assets", []) if "layers" in a]
     paths_by_comp = {}
@@ -140,6 +151,19 @@ def lint(path: Path):
         worst = max(paths_by_comp, key=paths_by_comp.get)
         warnings.append(f"heavy: {vector_paths} vector paths (budget {MAX_VECTOR_PATHS}, AE banners ~35), "
                         f"{paths_by_comp[worst]} of them in {worst}. Flatten static or opacity-only groups to images")
+    # offscreen passes on the busiest frame: matted or masked layers alive at once (precomps counted whole)
+    def passes(layers, frame=None):
+        return sum(1 for l in layers if (l.get("tt") or l.get("masksProperties"))
+                   and (frame is None or l.get("ip", 0) <= frame < l.get("op", 0)))
+    precomp_passes = sum(passes(layers) for where, layers in comps if where != "root")
+    root_layers = anim.get("layers", [])
+    span = range(int(anim.get("ip", 0)), max(int(anim.get("ip", 0)) + 1, int(anim.get("op", 0))))
+    offscreen = max(passes(root_layers, f) for f in span) + precomp_passes
+    if offscreen > MAX_OFFSCREEN_PASSES:
+        warnings.append(f"heavy: up to {offscreen} mattes/masks drawn at once (budget {MAX_OFFSCREEN_PASSES}, AE banners ~2); "
+                        "each is an offscreen pass per frame on Android. Delete hidden/unused matted layers, "
+                        "trim layers to the frames they're visible, flatten static matted art to images")
+
     image_mb = image_px * 4 / 1e6
     if image_mb > MAX_IMAGE_MB:
         warnings.append(f"heavy: images decode to {image_mb:.0f} MB (budget {MAX_IMAGE_MB} MB)")
@@ -148,6 +172,7 @@ def lint(path: Path):
         "size": f"{anim.get('w')}x{anim.get('h')}",
         "frames": f"{anim.get('ip')}-{anim.get('op')} @ {anim.get('fr')}fps",
         "vector paths": vector_paths,
+        "mattes+masks": offscreen,
         "images": f"{sum(1 for a in assets.values() if 'p' in a)} ({image_mb:.0f} MB decoded)",
         "generator": (anim.get("meta") or {}).get("g", "") or (anim.get("nm") or ""),
     }

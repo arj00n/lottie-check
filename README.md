@@ -52,7 +52,7 @@ Re-run `install.sh` after updating.
 | Step | Cost | What runs | Mirrors Swish |
 |---|---|---|---|
 | Cache | ~0 s | Results keyed by file contents (`out/<name>-<hash>/result.json`) | An unchanged file is never re-tested (`--force` to override) |
-| Lint | <0.1 s | Python | Hollow layers, images missing from the zip, broken asset refs. Budgets: >250 vector paths or >24 MB of decoded images (AE banners: ~35 paths, ~8 MB) |
+| Lint | <0.1 s | Python | Hollow layers, zips Android can't open (Figma's own `.lottie` export), images missing from the zip, broken asset refs. Budgets: >250 vector paths, >16 mattes/masks drawn at once, or >24 MB of decoded images (AE banners: ~35 paths, ~2 mattes, ~8 MB) |
 | iOS | ~1 s | `ios-harness/` on this Mac, lottie-ios **4.5.0**, Core Animation engine, Metal `CARenderer` | lottie-react-native 7.3.5 with a cached `file://`: `.lottie` → `LottieAnimationView(dotLottieUrl:)`, `.json` → `JSONDecoder` |
 | Android | ~1 s/file, ~3 s per batch | lottie-android **6.5.2** under Robolectric (real parser, real Skia, no emulator), plus a draw-cost bench | The same parser `setAnimationFromUrl` ends in (`fromZipStreamSync` / `fromJsonInputStreamSync`) |
 
@@ -73,6 +73,7 @@ A typical new file takes 2–5 s and uses no tokens. Claude only runs on inbox f
 
 ## Fix tools (`fixes/`)
 
+- `rezip_lottie.py in.lottie out.lottie`: rewrite a Figma `.lottie` zip that lottie-android can't open. The contents are unchanged.
 - `pack_lottie.py in.json out.lottie`: pack a Figma JSON export. dotlottie-js 1.8.0 hollows Figma precomps, and lint flags that.
 - `flatten_led_example.py`: flattens dot-matrix LED text into per-letter image layers using `bin/Rasterize` (`ios-harness/.build/release/Rasterize` in a source checkout).
 

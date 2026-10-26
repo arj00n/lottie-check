@@ -32,6 +32,18 @@ python3 ~/lottie-check/fixes/pack_lottie.py source.json fixed.lottie
 
 If no source JSON exists, stop. Say the designer needs to re-export the JSON from Figma.
 
+### Zip Android can't open (lint error "stored uncompressed with a data descriptor", Android `ZipException: only DEFLATED entries can have EXT descriptor`)
+
+Figma's own `.lottie` export writes the zip in a way lottie-android's reader rejects; the animation itself is fine (iOS plays it). Rewrite the container, contents unchanged:
+
+```bash
+python3 ~/lottie-check/fixes/rezip_lottie.py in.lottie fixed.lottie
+```
+
+### Heavy mattes/masks (lint warning "heavy: up to N mattes/masks drawn at once")
+
+Each matted or masked layer is an offscreen pass per frame on Android. Common in Figma exports: hidden "dormant" variants and layers that span the whole timeline though visible briefly. Safe fixes: delete matted layers whose opacity is 0 for the whole animation, and trim `ip`/`op` to the frames a layer is actually visible (check opacity keyframes and parents). Re-check visually: frames must not change. Anything beyond that (merging or flattening matted art) is a designer change; report it rather than guessing.
+
 ### Heavy (lint warning "heavy: N vector paths")
 
 Usually Figma dot-matrix/LED text or particle fields drawn as one vector per dot. Find the comp with most paths (named in the warning). Check what is animated inside it:
