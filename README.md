@@ -77,6 +77,20 @@ A typical new file takes 2–5 s and uses no tokens. Claude only runs on inbox f
 - `pack_lottie.py in.json out.lottie`: pack a Figma JSON export. dotlottie-js 1.8.0 hollows Figma precomps, and lint flags that.
 - `flatten_led_example.py`: flattens dot-matrix LED text into per-letter image layers using `bin/Rasterize` (`ios-harness/.build/release/Rasterize` in a source checkout).
 
+The rest work on an unpacked work dir (`manifest.json`, `animations/`, `images/`):
+
+- `lottie_work.py unpack in.lottie DIR` / `lottie_work.py pack DIR out.lottie`: unpack, or pack into a zip lottie-android can open.
+- `flatten_shapes.py DIR [--min-paths N] [--scale K]`: replace static shape layers (Figma halftone textures, outlined art) with images rendered by lottie-ios. Static masks are baked in, and duplicate images are merged.
+- `android_bake.py DIR --keep SPEC -o out.png [--scale SPEC=PCT] [--fix-tracking]`: render layers with lottie-android over black and white and recover a transparent PNG. Use it for Figma text (lottie-ios draws system fonts instead of the embedded glyphs) and blur effects (lottie-ios ignores them).
+- `bake_blend.py DIR IND`: bake a blend-mode layer over its static backdrop into a normal image, for lottie-ios's Core Animation engine, which ignores blend modes.
+- `squircle.py DIR [--smoothing 1.0]`: give the frame iOS continuous corners (Figma corner smoothing; 1.0 = 100%). Rebuilds rounded-rect masks and the canvas-sized background rectangle. Corner math ported from [figma-squircle](https://github.com/phamfoo/figma-squircle) (MIT).
+- `clamp_opacity.py DIR`: clamp opacity keyframes above 100 (Figma easing overshoot) that flicker on device.
+- `compress_images.py DIR`: drop unused assets, merge duplicates, pngquant + oxipng.
+- `diff_frames.py OUT_A OUT_B [--cross]`: compare frame PNGs from two `out/` folders.
+- `lottiekit.py`: shared helpers. `swift/` holds the image tools; they're compiled on first use into `fixes/.bin/`, which needs the Xcode command line tools.
+
+How and when to use each is in the `lottie-fix` skill.
+
 ## Keeping it in sync with Swish
 
 When Swish bumps Lottie, update `ios-harness/Package.swift` (`exact:`) and `android/app/build.gradle.kts`, then bump `TOOL_VERSION` in `lottie-check` so cached results are redone. lottie-ios comes from Swish's `ios/Podfile.lock`. For lottie-android, the version that wins is the higher of the app's pin in `android/app/build.gradle` and lottie-react-native's own `android/build.gradle`.

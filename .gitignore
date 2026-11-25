@@ -9,3 +9,4 @@ dist/
 ios-harness/.build/
 ios-harness/.swiftpm/
 out/
+fixes/.bin/
